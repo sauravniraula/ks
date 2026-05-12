@@ -1,7 +1,13 @@
 use crate::storage::{UnlockedVault, VaultStore};
-use anyhow::Result;
+use anyhow::{Context as AnyhowContext, Result};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
+use std::{fs, path::PathBuf};
 
+const APP_DIR: &str = "rust_keystore";
+const WINDOW_SETTINGS_FILE: &str = "window.json";
+const DEFAULT_WINDOW_SIZE: [f32; 2] = [1040.0, 680.0];
+const MIN_WINDOW_SIZE: [f32; 2] = [820.0, 560.0];
 const BG: egui::Color32 = egui::Color32::from_gray(14);
 const PANEL: egui::Color32 = egui::Color32::from_gray(24);
 const PANEL_ALT: egui::Color32 = egui::Color32::from_gray(19);
@@ -16,10 +22,11 @@ const DANGER_TEXT: egui::Color32 = egui::Color32::from_gray(205);
 const DANGER_BG: egui::Color32 = egui::Color32::from_gray(34);
 
 pub fn run() -> Result<()> {
+    let initial_window_size = load_window_size().unwrap_or(DEFAULT_WINDOW_SIZE);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1040.0, 680.0])
-            .with_min_inner_size([820.0, 560.0]),
+            .with_inner_size(initial_window_size)
+            .with_min_inner_size(MIN_WINDOW_SIZE),
         ..Default::default()
     };
 
@@ -30,7 +37,7 @@ pub fn run() -> Result<()> {
             apply_fonts(&cc.egui_ctx);
             apply_style(&cc.egui_ctx);
             let logo = load_logo_texture(&cc.egui_ctx)?;
-            Ok(Box::new(KeyStoreApp::new(logo)))
+            Ok(Box::new(KeyStoreApp::new(logo, initial_window_size)))
         }),
     )
     .map_err(|err| anyhow::anyhow!("failed to launch desktop app: {err}"))
@@ -38,6 +45,7 @@ pub fn run() -> Result<()> {
 
 struct KeyStoreApp {
     logo: egui::TextureHandle,
+    last_window_size: [f32; 2],
     store: Result<VaultStore, String>,
     vault: Option<UnlockedVault>,
     password: String,
@@ -51,9 +59,10 @@ struct KeyStoreApp {
 }
 
 impl KeyStoreApp {
-    fn new(logo: egui::TextureHandle) -> Self {
+    fn new(logo: egui::TextureHandle, last_window_size: [f32; 2]) -> Self {
         Self {
             logo,
+            last_window_size,
             store: VaultStore::new().map_err(|err| err.to_string()),
             vault: None,
             password: String::new(),
@@ -150,10 +159,28 @@ impl KeyStoreApp {
             }
         }
     }
+
+    fn remember_window_size(&mut self, ctx: &egui::Context) {
+        let Some(size) = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()))
+        else {
+            return;
+        };
+        let size = clamp_window_size([size.x.round(), size.y.round()]);
+        if size == self.last_window_size {
+            return;
+        }
+
+        self.last_window_size = size;
+        if let Err(err) = save_window_size(size) {
+            self.message = format!("Failed to save window size: {err}");
+        }
+    }
 }
 
 impl eframe::App for KeyStoreApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.remember_window_size(ctx);
+
         if self.vault.is_none() {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(BG))
@@ -627,6 +654,57 @@ fn load_logo_texture(ctx: &egui::Context) -> Result<egui::TextureHandle> {
         color_image,
         egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
     ))
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct WindowSettings {
+    width: f32,
+    height: f32,
+}
+
+fn load_window_size() -> Result<[f32; 2]> {
+    let path = window_settings_path()?;
+    if !path.exists() {
+        return Ok(DEFAULT_WINDOW_SIZE);
+    }
+
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let settings: WindowSettings = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    Ok(clamp_window_size([settings.width, settings.height]))
+}
+
+fn save_window_size(size: [f32; 2]) -> Result<()> {
+    let path = window_settings_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let settings = WindowSettings {
+        width: size[0],
+        height: size[1],
+    };
+    let content =
+        serde_json::to_string_pretty(&settings).context("failed to encode window settings")?;
+    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn window_settings_path() -> Result<PathBuf> {
+    let mut path = dirs::config_dir().context("could not find config directory")?;
+    path.push(APP_DIR);
+    path.push(WINDOW_SETTINGS_FILE);
+    Ok(path)
+}
+
+fn clamp_window_size(size: [f32; 2]) -> [f32; 2] {
+    [
+        size[0].clamp(MIN_WINDOW_SIZE[0], 4096.0),
+        size[1].clamp(MIN_WINDOW_SIZE[1], 3072.0),
+    ]
 }
 
 fn card_frame() -> egui::Frame {
