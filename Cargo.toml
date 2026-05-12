@@ -1,0 +1,23 @@
+[package]
+name = "rust_keystore"
+version = "0.1.0"
+edition = "2021"
+default-run = "ks"
+
+[[bin]]
+name = "ks"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+dirs = "5.0"
+argon2 = "0.5"
+base64 = "0.22"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rpassword = "7.3"
+rand_core = { version = "0.6", features = ["getrandom"] }
