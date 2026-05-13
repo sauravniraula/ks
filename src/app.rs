@@ -2,7 +2,7 @@ use crate::storage::{UnlockedVault, VaultStore};
 use anyhow::{Context as AnyhowContext, Result};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
 
 const APP_DIR: &str = "rust_keystore";
 const WINDOW_SETTINGS_FILE: &str = "window.json";
@@ -71,6 +71,7 @@ struct KeyStoreApp {
     pending_delete_group: Option<String>,
     pending_delete_secret: Option<String>,
     login_password_needs_focus: bool,
+    copied_at: Option<f64>,
     message: String,
 }
 
@@ -100,6 +101,7 @@ impl KeyStoreApp {
             pending_delete_group: None,
             pending_delete_secret: None,
             login_password_needs_focus: true,
+            copied_at: None,
             message: String::new(),
         }
     }
@@ -151,6 +153,7 @@ impl KeyStoreApp {
                 self.selected_key = None;
                 self.edit_key.clear();
                 self.edit_value.clear();
+                self.copied_at = None;
             }
         }
     }
@@ -164,6 +167,7 @@ impl KeyStoreApp {
                     self.selected_key = None;
                     self.edit_key.clear();
                     self.edit_value.clear();
+                    self.copied_at = None;
                 }
                 Err(err) => self.message = err.to_string(),
             }
@@ -177,6 +181,7 @@ impl KeyStoreApp {
                     self.selected_key = Some(self.new_key.clone());
                     self.edit_key = self.new_key.clone();
                     self.edit_value = self.new_value.clone();
+                    self.copied_at = None;
                     self.message = format!("Saved '{}'", self.new_key);
                     self.new_key.clear();
                     self.new_value.clear();
@@ -196,6 +201,7 @@ impl KeyStoreApp {
                         self.message = format!("Renamed '{key}' to '{}'", self.edit_key);
                     }
                     self.selected_key = Some(self.edit_key.clone());
+                    self.copied_at = None;
                 }
                 Err(err) => self.message = err.to_string(),
             }
@@ -233,6 +239,7 @@ impl KeyStoreApp {
                         self.selected_key = None;
                         self.edit_key.clear();
                         self.edit_value.clear();
+                        self.copied_at = None;
                     }
                 }
                 Err(err) => self.delete_group_error = err.to_string(),
@@ -257,6 +264,7 @@ impl KeyStoreApp {
                         self.selected_key = None;
                         self.edit_key.clear();
                         self.edit_value.clear();
+                        self.copied_at = None;
                     }
                 }
                 Ok(false) => {
@@ -428,6 +436,7 @@ impl KeyStoreApp {
                             self.pending_delete_group = None;
                             self.pending_delete_secret = None;
                             self.login_password_needs_focus = true;
+                            self.copied_at = None;
                             self.message = "Locked".to_string();
                         }
                     });
@@ -499,6 +508,7 @@ impl KeyStoreApp {
                                     self.selected_key = None;
                                     self.edit_key.clear();
                                     self.edit_value.clear();
+                                    self.copied_at = None;
                                     self.delete_group_password.clear();
                                     self.delete_group_error.clear();
                                     self.message = format!("Active group: {group}");
@@ -581,6 +591,7 @@ impl KeyStoreApp {
                     if response.clicked() {
                         self.selected_key = Some(key);
                         self.refresh_selected_value();
+                        self.copied_at = None;
                     }
                 }
             });
@@ -600,7 +611,27 @@ impl KeyStoreApp {
                 padded_singleline(&mut self.edit_key, "Key").font(egui::TextStyle::Monospace),
             );
             ui.add_space(18.0);
-            ui.label(egui::RichText::new("Value").color(MUTED).size(12.0));
+            ui.horizontal(|ui| {
+                let now = ui.input(|input| input.time);
+                ui.label(egui::RichText::new("Value").color(MUTED).size(12.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if copy_icon_button(ui).clicked() {
+                        ui.ctx().copy_text(self.edit_value.clone());
+                        self.copied_at = Some(now);
+                        ui.ctx().request_repaint_after(Duration::from_secs(1));
+                    }
+                    if let Some(copied_at) = self.copied_at {
+                        let remaining = 1.0 - (now - copied_at);
+                        if remaining > 0.0 {
+                            ui.ctx()
+                                .request_repaint_after(Duration::from_secs_f64(remaining));
+                            ui.label(egui::RichText::new("Copied").color(MUTED).size(12.0));
+                        } else {
+                            self.copied_at = None;
+                        }
+                    }
+                });
+            });
             ui.add_sized(
                 [ui.available_width(), 150.0],
                 egui::TextEdit::multiline(&mut self.edit_value)
@@ -1069,6 +1100,35 @@ fn group_delete_menu(ui: &mut egui::Ui, menu_icon: &egui::TextureHandle) -> bool
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text("Group actions");
     menu.inner.unwrap_or(false)
+}
+
+fn copy_icon_button(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::vec2(20.0, 20.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let fill = if response.is_pointer_button_down_on() {
+            SELECTED_BG
+        } else if response.hovered() {
+            HOVER_BG
+        } else {
+            FIELD_BG
+        };
+        let stroke = egui::Stroke::new(1.0, if response.hovered() { MUTED } else { BORDER });
+        let painter = ui.painter();
+        painter.rect(rect, egui::Rounding::same(4.0), fill, stroke);
+
+        let back =
+            egui::Rect::from_min_size(rect.center() - egui::vec2(4.0, 5.0), egui::vec2(7.0, 9.0));
+        let front = back.translate(egui::vec2(3.0, 3.0));
+        let icon_stroke = egui::Stroke::new(1.25, TEXT);
+        painter.rect_stroke(back, egui::Rounding::same(1.5), icon_stroke);
+        painter.rect_stroke(front, egui::Rounding::same(1.5), icon_stroke);
+    }
+
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Copy secret value")
 }
 
 fn padded_singleline<'a>(value: &'a mut String, hint: &'static str) -> egui::TextEdit<'a> {

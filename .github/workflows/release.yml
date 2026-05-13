@@ -67,7 +67,9 @@ jobs:
           mkdir -p dist/package
           cp "target/release/${{ matrix.binary }}" "dist/package/${{ matrix.binary }}"
           cp README.md LICENSE dist/package/
-          cp assets/icon.png dist/package/
+          cp assets/icon.png assets/icon.ico dist/package/
+          cp scripts/install.sh scripts/uninstall.sh scripts/install.ps1 scripts/uninstall.ps1 dist/package/
+          chmod 755 dist/package/install.sh dist/package/uninstall.sh
 
           cd dist/package
           if [[ "${{ runner.os }}" == "Windows" ]]; then
