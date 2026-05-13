@@ -68,6 +68,12 @@ struct KeyStoreApp {
     new_group: String,
     delete_group_password: String,
     delete_group_error: String,
+    change_current_password: String,
+    change_new_password: String,
+    change_confirm_password: String,
+    change_password_error: String,
+    show_change_password: bool,
+    change_password_needs_focus: bool,
     pending_delete_group: Option<String>,
     pending_delete_secret: Option<String>,
     login_password_needs_focus: bool,
@@ -98,6 +104,12 @@ impl KeyStoreApp {
             new_group: String::new(),
             delete_group_password: String::new(),
             delete_group_error: String::new(),
+            change_current_password: String::new(),
+            change_new_password: String::new(),
+            change_confirm_password: String::new(),
+            change_password_error: String::new(),
+            show_change_password: false,
+            change_password_needs_focus: false,
             pending_delete_group: None,
             pending_delete_secret: None,
             login_password_needs_focus: true,
@@ -276,6 +288,66 @@ impl KeyStoreApp {
         }
     }
 
+    fn request_change_password(&mut self) {
+        self.change_current_password.clear();
+        self.change_new_password.clear();
+        self.change_confirm_password.clear();
+        self.change_password_error.clear();
+        self.show_change_password = true;
+        self.change_password_needs_focus = true;
+    }
+
+    fn cancel_change_password(&mut self) {
+        self.change_current_password.clear();
+        self.change_new_password.clear();
+        self.change_confirm_password.clear();
+        self.change_password_error.clear();
+        self.show_change_password = false;
+        self.change_password_needs_focus = false;
+    }
+
+    fn confirm_change_password(&mut self) {
+        self.change_password_error.clear();
+        let result = (|| -> Result<()> {
+            if self.change_new_password != self.change_confirm_password {
+                anyhow::bail!("passwords do not match");
+            }
+            let store = self.store().map_err(anyhow::Error::msg)?;
+            store
+                .unlock(&self.change_current_password)
+                .context("failed to verify current password")?;
+            let vault = self
+                .vault
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("vault is locked"))?;
+            vault.change_password(&self.change_new_password)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.cancel_change_password();
+                self.message = "Password changed".to_string();
+            }
+            Err(err) => self.change_password_error = err.to_string(),
+        }
+    }
+
+    fn logout_vault(&mut self) {
+        self.vault = None;
+        self.selected_key = None;
+        self.edit_key.clear();
+        self.edit_value.clear();
+        self.delete_group_password.clear();
+        self.delete_group_error.clear();
+        self.pending_delete_group = None;
+        self.pending_delete_secret = None;
+        self.cancel_change_password();
+        self.login_password_needs_focus = true;
+        self.copied_at = None;
+        self.message = "Logged out".to_string();
+    }
+
     fn remember_window_size(&mut self, ctx: &egui::Context) {
         let Some(size) = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()))
         else {
@@ -426,18 +498,11 @@ impl KeyStoreApp {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(secondary_button("Lock")).clicked() {
-                            self.vault = None;
-                            self.selected_key = None;
-                            self.edit_key.clear();
-                            self.edit_value.clear();
-                            self.delete_group_password.clear();
-                            self.delete_group_error.clear();
-                            self.pending_delete_group = None;
-                            self.pending_delete_secret = None;
-                            self.login_password_needs_focus = true;
-                            self.copied_at = None;
-                            self.message = "Locked".to_string();
+                        if let Some(action) = settings_menu(ui) {
+                            match action {
+                                SettingsAction::ChangePassword => self.request_change_password(),
+                                SettingsAction::Logout => self.logout_vault(),
+                            }
                         }
                     });
                 });
@@ -775,6 +840,79 @@ impl KeyStoreApp {
                 self.pending_delete_secret = None;
             }
         }
+
+        if self.show_change_password {
+            let mut open = true;
+            egui::Window::new("Change password")
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_width(340.0);
+                    ui.label(egui::RichText::new("Choose a new vault password.").color(TEXT));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Enter your current password before re-encrypting the vault.",
+                        )
+                        .color(MUTED),
+                    );
+                    ui.add_space(10.0);
+                    let current_response = ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        padded_singleline(&mut self.change_current_password, "Current password")
+                            .password(true),
+                    );
+                    if self.change_password_needs_focus {
+                        current_response.request_focus();
+                        self.change_password_needs_focus = false;
+                    }
+                    ui.add_space(8.0);
+                    let new_response = ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        padded_singleline(&mut self.change_new_password, "New password")
+                            .password(true),
+                    );
+                    ui.add_space(8.0);
+                    let confirm_response = ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        padded_singleline(
+                            &mut self.change_confirm_password,
+                            "Confirm new password",
+                        )
+                        .password(true),
+                    );
+                    if !self.change_password_error.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(&self.change_password_error).color(DANGER_TEXT),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let confirm = text_submitted(ui, &current_response)
+                            || text_submitted(ui, &new_response)
+                            || text_submitted(ui, &confirm_response)
+                            || ui
+                                .add_sized([92.0, 34.0], primary_button("Change"))
+                                .clicked();
+                        if confirm {
+                            self.confirm_change_password();
+                        }
+                        if ui
+                            .add_sized([86.0, 34.0], secondary_button("Cancel"))
+                            .clicked()
+                        {
+                            self.cancel_change_password();
+                        }
+                    });
+                });
+            if !open {
+                self.cancel_change_password();
+            }
+        }
     }
 }
 
@@ -1100,6 +1238,35 @@ fn group_delete_menu(ui: &mut egui::Ui, menu_icon: &egui::TextureHandle) -> bool
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text("Group actions");
     menu.inner.unwrap_or(false)
+}
+
+enum SettingsAction {
+    ChangePassword,
+    Logout,
+}
+
+fn settings_menu(ui: &mut egui::Ui) -> Option<SettingsAction> {
+    let button = egui::Button::new(egui::RichText::new("⚙").size(18.0).color(TEXT))
+        .frame(false)
+        .min_size(egui::vec2(32.0, 32.0));
+    let menu = egui::menu::menu_custom_button(ui, button, |ui| {
+        ui.set_min_width(150.0);
+        let mut action = None;
+        if ui.button("Change Password").clicked() {
+            action = Some(SettingsAction::ChangePassword);
+            ui.close_menu();
+        }
+        if ui.button("Logout").clicked() {
+            action = Some(SettingsAction::Logout);
+            ui.close_menu();
+        }
+        action
+    });
+
+    menu.response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Settings");
+    menu.inner.flatten()
 }
 
 fn copy_icon_button(ui: &mut egui::Ui) -> egui::Response {

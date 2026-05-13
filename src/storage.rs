@@ -213,6 +213,22 @@ impl UnlockedVault {
         Ok(())
     }
 
+    pub fn change_password(&mut self, password: &str) -> Result<()> {
+        let salt = random_salt();
+        let key = derive_key(password, &salt)?;
+        let previous_key = self.key;
+        let previous_salt = self.salt.clone();
+
+        self.key = key;
+        self.salt = salt.to_vec();
+        if let Err(err) = self.save() {
+            self.key = previous_key;
+            self.salt = previous_salt;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     pub fn switch_group(&mut self, group: &str) -> Result<()> {
         if !self.data.groups.contains_key(group) {
             return Err(anyhow!("group '{group}' does not exist"));
