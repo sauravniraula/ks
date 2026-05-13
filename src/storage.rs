@@ -247,6 +247,30 @@ impl UnlockedVault {
         self.save()
     }
 
+    pub fn rename_group(&mut self, old_group: &str, new_group: &str) -> Result<()> {
+        validate_name(new_group)?;
+        if !self.data.groups.contains_key(old_group) {
+            return Err(anyhow!("group '{old_group}' does not exist"));
+        }
+        if old_group == new_group {
+            return Ok(());
+        }
+        if self.data.groups.contains_key(new_group) {
+            return Err(anyhow!("group '{new_group}' already exists"));
+        }
+
+        let group = self
+            .data
+            .groups
+            .remove(old_group)
+            .ok_or_else(|| anyhow!("group '{old_group}' does not exist"))?;
+        self.data.groups.insert(new_group.to_string(), group);
+        if self.data.active_group == old_group {
+            self.data.active_group = new_group.to_string();
+        }
+        self.save()
+    }
+
     pub fn delete_group(&mut self, group: &str) -> Result<()> {
         if self.data.groups.len() == 1 {
             return Err(anyhow!("cannot delete the last group"));

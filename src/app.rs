@@ -6,6 +6,8 @@ use std::{fs, path::PathBuf, time::Duration};
 
 const APP_DIR: &str = "rust_keystore";
 const WINDOW_SETTINGS_FILE: &str = "window.json";
+const APP_VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+const APP_TITLE: &str = concat!("KS Encrypted Key Store v", env!("CARGO_PKG_VERSION"));
 const DEFAULT_WINDOW_SIZE: [f32; 2] = [1040.0, 680.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [820.0, 560.0];
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
@@ -34,7 +36,7 @@ pub fn run() -> Result<()> {
     };
 
     eframe::run_native(
-        "KS Encrypted Key Store",
+        APP_TITLE,
         options,
         Box::new(|cc| {
             apply_fonts(&cc.egui_ctx);
@@ -66,6 +68,9 @@ struct KeyStoreApp {
     new_key: String,
     new_value: String,
     new_group: String,
+    rename_group_name: String,
+    rename_group_error: String,
+    rename_group_needs_focus: bool,
     delete_group_password: String,
     delete_group_error: String,
     change_current_password: String,
@@ -74,6 +79,7 @@ struct KeyStoreApp {
     change_password_error: String,
     show_change_password: bool,
     change_password_needs_focus: bool,
+    pending_rename_group: Option<String>,
     pending_delete_group: Option<String>,
     pending_delete_secret: Option<String>,
     login_password_needs_focus: bool,
@@ -102,6 +108,9 @@ impl KeyStoreApp {
             new_key: String::new(),
             new_value: String::new(),
             new_group: String::new(),
+            rename_group_name: String::new(),
+            rename_group_error: String::new(),
+            rename_group_needs_focus: false,
             delete_group_password: String::new(),
             delete_group_error: String::new(),
             change_current_password: String::new(),
@@ -110,6 +119,7 @@ impl KeyStoreApp {
             change_password_error: String::new(),
             show_change_password: false,
             change_password_needs_focus: false,
+            pending_rename_group: None,
             pending_delete_group: None,
             pending_delete_secret: None,
             login_password_needs_focus: true,
@@ -216,6 +226,41 @@ impl KeyStoreApp {
                     self.copied_at = None;
                 }
                 Err(err) => self.message = err.to_string(),
+            }
+        }
+    }
+
+    fn request_rename_group(&mut self, group: String) {
+        self.rename_group_name = group.clone();
+        self.rename_group_error.clear();
+        self.rename_group_needs_focus = true;
+        self.pending_rename_group = Some(group);
+    }
+
+    fn cancel_rename_group(&mut self) {
+        self.pending_rename_group = None;
+        self.rename_group_name.clear();
+        self.rename_group_error.clear();
+        self.rename_group_needs_focus = false;
+    }
+
+    fn confirm_rename_group(&mut self) {
+        let Some(group) = self.pending_rename_group.clone() else {
+            return;
+        };
+        let new_group = self.rename_group_name.clone();
+
+        if let Some(vault) = &mut self.vault {
+            match vault.rename_group(&group, &new_group) {
+                Ok(()) => {
+                    if group == new_group {
+                        self.message = format!("Group '{group}' unchanged");
+                    } else {
+                        self.message = format!("Renamed group '{group}' to '{new_group}'");
+                    }
+                    self.cancel_rename_group();
+                }
+                Err(err) => self.rename_group_error = err.to_string(),
             }
         }
     }
@@ -338,6 +383,7 @@ impl KeyStoreApp {
         self.selected_key = None;
         self.edit_key.clear();
         self.edit_value.clear();
+        self.cancel_rename_group();
         self.delete_group_password.clear();
         self.delete_group_error.clear();
         self.pending_delete_group = None;
@@ -496,6 +542,11 @@ impl KeyStoreApp {
                             .strong()
                             .color(TEXT),
                     );
+                    ui.label(
+                        egui::RichText::new(APP_VERSION_LABEL)
+                            .size(12.0)
+                            .color(MUTED),
+                    );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(action) = settings_menu(ui) {
@@ -564,7 +615,9 @@ impl KeyStoreApp {
                         &self.menu_icon,
                     );
                     ui.add_space(6.0);
-                    if response.delete_requested {
+                    if response.rename_requested {
+                        self.request_rename_group(group);
+                    } else if response.delete_requested {
                         self.request_delete_group(group);
                     } else if response.row.clicked() {
                         if let Some(vault) = &mut self.vault {
@@ -750,6 +803,52 @@ impl KeyStoreApp {
     }
 
     fn confirmation_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(group) = self.pending_rename_group.clone() {
+            let mut open = true;
+            egui::Window::new("Rename group")
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_width(320.0);
+                    ui.label(egui::RichText::new(format!("Rename group \"{group}\"")).color(TEXT));
+                    ui.add_space(8.0);
+                    let name_response = ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        padded_singleline(&mut self.rename_group_name, "Group name"),
+                    );
+                    if self.rename_group_needs_focus {
+                        name_response.request_focus();
+                        self.rename_group_needs_focus = false;
+                    }
+                    if !self.rename_group_error.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&self.rename_group_error).color(DANGER_TEXT));
+                    }
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let confirm = text_submitted(ui, &name_response)
+                            || ui
+                                .add_sized([92.0, 34.0], primary_button("Rename"))
+                                .clicked();
+                        if confirm {
+                            self.confirm_rename_group();
+                        }
+                        if ui
+                            .add_sized([86.0, 34.0], secondary_button("Cancel"))
+                            .clicked()
+                        {
+                            self.cancel_rename_group();
+                        }
+                    });
+                });
+            if !open {
+                self.cancel_rename_group();
+            }
+        }
+
         if let Some(group) = self.pending_delete_group.clone() {
             let mut open = true;
             egui::Window::new("Delete group")
@@ -1092,6 +1191,7 @@ fn logo_mark(ui: &mut egui::Ui, logo: &egui::TextureHandle, height: f32) -> egui
 
 struct GroupRowResponse {
     row: egui::Response,
+    rename_requested: bool,
     delete_requested: bool,
 }
 
@@ -1100,7 +1200,7 @@ fn group_row(
     name: &str,
     count: usize,
     selected: bool,
-    can_delete: bool,
+    can_manage: bool,
     menu_icon: &egui::TextureHandle,
 ) -> GroupRowResponse {
     let fill = if selected { SELECTED_BG } else { PANEL_ALT };
@@ -1110,6 +1210,7 @@ fn group_row(
         egui::Stroke::new(1.0, egui::Color32::TRANSPARENT)
     };
 
+    let mut rename_requested = false;
     let mut delete_requested = false;
     let mut row = None;
     egui::Frame::none()
@@ -1120,7 +1221,7 @@ fn group_row(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let menu_width = if can_delete { 28.0 } else { 0.0 };
+                let menu_width = if can_manage { 28.0 } else { 0.0 };
                 let label_width = (ui.available_width() - 34.0 - menu_width).max(32.0);
                 row = Some(clickable_row_text(
                     ui,
@@ -1131,8 +1232,12 @@ fn group_row(
                     if selected { SELECTED } else { TEXT },
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if can_delete {
-                        delete_requested = group_delete_menu(ui, menu_icon);
+                    if can_manage {
+                        match group_actions_menu(ui, menu_icon) {
+                            Some(GroupAction::Rename) => rename_requested = true,
+                            Some(GroupAction::Delete) => delete_requested = true,
+                            None => {}
+                        }
                     }
                     ui.add(
                         egui::Label::new(
@@ -1149,6 +1254,7 @@ fn group_row(
 
     GroupRowResponse {
         row: row.expect("group row text button should be present"),
+        rename_requested,
         delete_requested,
     }
 }
@@ -1215,7 +1321,12 @@ fn clickable_row_text(
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn group_delete_menu(ui: &mut egui::Ui, menu_icon: &egui::TextureHandle) -> bool {
+enum GroupAction {
+    Rename,
+    Delete,
+}
+
+fn group_actions_menu(ui: &mut egui::Ui, menu_icon: &egui::TextureHandle) -> Option<GroupAction> {
     let image = egui::Image::from_texture(menu_icon).fit_to_exact_size(egui::vec2(18.0, 18.0));
     let menu = egui::menu::menu_custom_button(
         ui,
@@ -1224,20 +1335,26 @@ fn group_delete_menu(ui: &mut egui::Ui, menu_icon: &egui::TextureHandle) -> bool
             .min_size(egui::vec2(24.0, 24.0)),
         |ui| {
             ui.set_min_width(110.0);
-            let delete_clicked = ui
-                .button(egui::RichText::new("Delete").color(DANGER_TEXT))
-                .clicked();
-            if delete_clicked {
+            let mut action = None;
+            if ui.button("Rename").clicked() {
+                action = Some(GroupAction::Rename);
                 ui.close_menu();
             }
-            delete_clicked
+            if ui
+                .button(egui::RichText::new("Delete").color(DANGER_TEXT))
+                .clicked()
+            {
+                action = Some(GroupAction::Delete);
+                ui.close_menu();
+            }
+            action
         },
     );
 
     menu.response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text("Group actions");
-    menu.inner.unwrap_or(false)
+    menu.inner.flatten()
 }
 
 enum SettingsAction {

@@ -7,6 +7,7 @@ use rpassword::prompt_password;
 
 #[derive(Parser)]
 #[command(name = "ks")]
+#[command(version)]
 #[command(about = "Encrypted desktop and CLI key store")]
 pub struct Cli {
     #[command(subcommand)]
