@@ -71,10 +71,6 @@ pub fn clear() -> Result<bool> {
     }
 }
 
-pub fn path() -> Result<PathBuf> {
-    session_path()
-}
-
 fn session_path() -> Result<PathBuf> {
     let mut path = dirs::config_dir().ok_or_else(|| anyhow!("could not find config directory"))?;
     path.push(APP_DIR);

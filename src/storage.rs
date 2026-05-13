@@ -69,10 +69,6 @@ impl VaultStore {
         Ok(Self { path })
     }
 
-    pub fn path(&self) -> &PathBuf {
-        &self.path
-    }
-
     fn legacy_path(&self) -> PathBuf {
         let mut path = self.path.clone();
         path.set_file_name(LEGACY_FILE);
@@ -259,6 +255,23 @@ impl UnlockedVault {
         self.active_group_mut()?
             .secrets
             .insert(key.to_string(), value.to_string());
+        self.save()
+    }
+
+    pub fn rename_secret(&mut self, old_key: &str, new_key: &str, value: &str) -> Result<()> {
+        validate_name(new_key)?;
+        if old_key != new_key && self.active_group_ref()?.secrets.contains_key(new_key) {
+            return Err(anyhow!("secret '{new_key}' already exists"));
+        }
+
+        let group = self.active_group_mut()?;
+        if old_key != new_key {
+            group
+                .secrets
+                .remove(old_key)
+                .ok_or_else(|| anyhow!("secret '{old_key}' does not exist"))?;
+        }
+        group.secrets.insert(new_key.to_string(), value.to_string());
         self.save()
     }
 

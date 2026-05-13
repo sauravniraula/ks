@@ -78,6 +78,9 @@ pub enum GroupCommand {
     Delete {
         /// Group name.
         name: String,
+        /// Read the password from an environment variable instead of prompting.
+        #[arg(long, value_name = "VAR")]
+        password_env: Option<String>,
     },
 }
 
@@ -97,7 +100,7 @@ pub fn run(command: Commands) -> Result<()> {
         Commands::Delete { key } => delete(&key),
         Commands::Group { command } => match command {
             GroupCommand::Create { name } => create_group(&name),
-            GroupCommand::Delete { name } => delete_group(&name),
+            GroupCommand::Delete { name, password_env } => delete_group(&name, password_env),
         },
         Commands::Groups => groups(),
     }
@@ -166,8 +169,6 @@ fn status() -> Result<()> {
         }
         Err(err) => {
             println!("Logged out");
-            println!("Vault: {}", store.path().display());
-            println!("Session: {}", session::path()?.display());
             println!("Reason: {err}");
         }
     }
@@ -242,8 +243,12 @@ fn create_group(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn delete_group(name: &str) -> Result<()> {
+fn delete_group(name: &str, password_env: Option<String>) -> Result<()> {
     let mut vault = unlock_from_session()?;
+    let password = read_password("Password to delete group: ", password_env.as_deref())?;
+    VaultStore::new()?
+        .unlock(&password)
+        .context("failed to verify password for group deletion")?;
     vault.delete_group(name)?;
     session::save(&Session::new(vault.key(), vault.active_group())?)?;
     println!("Deleted group '{name}'");

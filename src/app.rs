@@ -37,7 +37,12 @@ pub fn run() -> Result<()> {
             apply_fonts(&cc.egui_ctx);
             apply_style(&cc.egui_ctx);
             let logo = load_logo_texture(&cc.egui_ctx)?;
-            Ok(Box::new(KeyStoreApp::new(logo, initial_window_size)))
+            let menu_icon = load_menu_texture(&cc.egui_ctx)?;
+            Ok(Box::new(KeyStoreApp::new(
+                logo,
+                menu_icon,
+                initial_window_size,
+            )))
         }),
     )
     .map_err(|err| anyhow::anyhow!("failed to launch desktop app: {err}"))
@@ -45,33 +50,53 @@ pub fn run() -> Result<()> {
 
 struct KeyStoreApp {
     logo: egui::TextureHandle,
+    menu_icon: egui::TextureHandle,
     last_window_size: [f32; 2],
     store: Result<VaultStore, String>,
     vault: Option<UnlockedVault>,
     password: String,
     confirm_password: String,
     selected_key: Option<String>,
+    edit_key: String,
     edit_value: String,
+    secret_search: String,
     new_key: String,
     new_value: String,
     new_group: String,
+    delete_group_password: String,
+    delete_group_error: String,
+    pending_delete_group: Option<String>,
+    pending_delete_secret: Option<String>,
+    login_password_needs_focus: bool,
     message: String,
 }
 
 impl KeyStoreApp {
-    fn new(logo: egui::TextureHandle, last_window_size: [f32; 2]) -> Self {
+    fn new(
+        logo: egui::TextureHandle,
+        menu_icon: egui::TextureHandle,
+        last_window_size: [f32; 2],
+    ) -> Self {
         Self {
             logo,
+            menu_icon,
             last_window_size,
             store: VaultStore::new().map_err(|err| err.to_string()),
             vault: None,
             password: String::new(),
             confirm_password: String::new(),
             selected_key: None,
+            edit_key: String::new(),
             edit_value: String::new(),
+            secret_search: String::new(),
             new_key: String::new(),
             new_value: String::new(),
             new_group: String::new(),
+            delete_group_password: String::new(),
+            delete_group_error: String::new(),
+            pending_delete_group: None,
+            pending_delete_secret: None,
+            login_password_needs_focus: true,
             message: String::new(),
         }
     }
@@ -97,6 +122,7 @@ impl KeyStoreApp {
         match result {
             Ok(vault) => {
                 self.vault = Some(vault);
+                self.login_password_needs_focus = true;
                 self.password.clear();
                 self.confirm_password.clear();
                 self.message = "Unlocked".to_string();
@@ -114,9 +140,13 @@ impl KeyStoreApp {
         };
 
         match vault.get(key) {
-            Ok(Some(value)) => self.edit_value = value.clone(),
+            Ok(Some(value)) => {
+                self.edit_key = key.clone();
+                self.edit_value = value.clone();
+            }
             _ => {
                 self.selected_key = None;
+                self.edit_key.clear();
                 self.edit_value.clear();
             }
         }
@@ -129,6 +159,7 @@ impl KeyStoreApp {
                     self.message = format!("Created group '{}'", self.new_group);
                     self.new_group.clear();
                     self.selected_key = None;
+                    self.edit_key.clear();
                     self.edit_value.clear();
                 }
                 Err(err) => self.message = err.to_string(),
@@ -141,6 +172,7 @@ impl KeyStoreApp {
             match vault.set(&self.new_key, &self.new_value) {
                 Ok(()) => {
                     self.selected_key = Some(self.new_key.clone());
+                    self.edit_key = self.new_key.clone();
                     self.edit_value = self.new_value.clone();
                     self.message = format!("Saved '{}'", self.new_key);
                     self.new_key.clear();
@@ -153,8 +185,81 @@ impl KeyStoreApp {
 
     fn update_secret(&mut self, key: &str) {
         if let Some(vault) = &mut self.vault {
-            match vault.set(key, &self.edit_value) {
-                Ok(()) => self.message = format!("Updated '{key}'"),
+            match vault.rename_secret(key, &self.edit_key, &self.edit_value) {
+                Ok(()) => {
+                    if key == self.edit_key {
+                        self.message = format!("Updated '{key}'");
+                    } else {
+                        self.message = format!("Renamed '{key}' to '{}'", self.edit_key);
+                    }
+                    self.selected_key = Some(self.edit_key.clone());
+                }
+                Err(err) => self.message = err.to_string(),
+            }
+        }
+    }
+
+    fn request_delete_group(&mut self, group: String) {
+        self.pending_delete_group = Some(group);
+        self.delete_group_password.clear();
+        self.delete_group_error.clear();
+    }
+
+    fn confirm_delete_group(&mut self) {
+        let Some(group) = self.pending_delete_group.clone() else {
+            return;
+        };
+        let verified = self
+            .store()
+            .map_err(anyhow::Error::msg)
+            .and_then(|store| store.unlock(&self.delete_group_password).map(|_| ()));
+        if let Err(err) = verified {
+            self.delete_group_error = format!("Failed to verify password: {err}");
+            return;
+        }
+
+        self.delete_group_password.clear();
+        self.delete_group_error.clear();
+        if let Some(vault) = &mut self.vault {
+            let deleted_active = vault.active_group() == group;
+            match vault.delete_group(&group) {
+                Ok(()) => {
+                    self.message = format!("Deleted group '{group}'");
+                    self.pending_delete_group = None;
+                    if deleted_active {
+                        self.selected_key = None;
+                        self.edit_key.clear();
+                        self.edit_value.clear();
+                    }
+                }
+                Err(err) => self.delete_group_error = err.to_string(),
+            }
+        }
+    }
+
+    fn request_delete_secret(&mut self, key: String) {
+        self.pending_delete_secret = Some(key);
+    }
+
+    fn confirm_delete_secret(&mut self) {
+        let Some(key) = self.pending_delete_secret.clone() else {
+            return;
+        };
+        if let Some(vault) = &mut self.vault {
+            match vault.delete(&key) {
+                Ok(true) => {
+                    self.message = format!("Deleted '{key}'");
+                    self.pending_delete_secret = None;
+                    if self.selected_key.as_ref() == Some(&key) {
+                        self.selected_key = None;
+                        self.edit_key.clear();
+                        self.edit_value.clear();
+                    }
+                }
+                Ok(false) => {
+                    self.message = format!("'{key}' was already missing");
+                    self.pending_delete_secret = None;
+                }
                 Err(err) => self.message = err.to_string(),
             }
         }
@@ -189,7 +294,6 @@ impl eframe::App for KeyStoreApp {
         }
 
         self.top_bar(ctx);
-        self.status_bar(ctx);
 
         egui::SidePanel::left("groups_sidebar")
             .exact_width(260.0)
@@ -220,6 +324,8 @@ impl eframe::App for KeyStoreApp {
                     .inner_margin(egui::Margin::same(18.0)),
             )
             .show(ctx, |ui| self.editor_workspace(ui));
+
+        self.confirmation_dialogs(ctx);
     }
 }
 
@@ -252,6 +358,10 @@ impl KeyStoreApp {
                     [ui.available_width(), 38.0],
                     padded_singleline(&mut self.password, "Password").password(true),
                 );
+                if self.login_password_needs_focus {
+                    password_response.request_focus();
+                    self.login_password_needs_focus = false;
+                }
                 let mut submit = text_submitted(ui, &password_response);
                 if !vault_exists {
                     ui.add_space(8.0);
@@ -285,12 +395,6 @@ impl KeyStoreApp {
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
-        let active = self
-            .vault
-            .as_ref()
-            .map(|vault| vault.active_group().to_string())
-            .unwrap_or_default();
-
         egui::TopBottomPanel::top("top_bar")
             .exact_height(64.0)
             .frame(
@@ -309,40 +413,22 @@ impl KeyStoreApp {
                             .strong()
                             .color(TEXT),
                     );
-                    ui.add_space(16.0);
-                    ui.label(
-                        egui::RichText::new(format!("Active: {active}"))
-                            .size(13.0)
-                            .color(MUTED),
-                    );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(secondary_button("Lock")).clicked() {
                             self.vault = None;
                             self.selected_key = None;
+                            self.edit_key.clear();
                             self.edit_value.clear();
+                            self.delete_group_password.clear();
+                            self.delete_group_error.clear();
+                            self.pending_delete_group = None;
+                            self.pending_delete_secret = None;
+                            self.login_password_needs_focus = true;
                             self.message = "Locked".to_string();
                         }
                     });
                 });
-            });
-    }
-
-    fn status_bar(&mut self, ctx: &egui::Context) {
-        if self.message.is_empty() {
-            return;
-        }
-
-        egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(36.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
-                    .inner_margin(egui::Margin::symmetric(22.0, 8.0)),
-            )
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new(&self.message).color(message_color()));
             });
     }
 
@@ -388,18 +474,30 @@ impl KeyStoreApp {
         egui::ScrollArea::vertical()
             .id_salt("groups_scroll")
             .auto_shrink([false, false])
-            .max_height((ui.available_height() - 160.0).max(160.0))
+            .max_height((ui.available_height() - 130.0).max(60.0))
             .show(ui, |ui| {
                 for (group, count) in groups {
                     let selected = group == active;
-                    let response = group_row(ui, &group, count, selected);
+                    let response = group_row(
+                        ui,
+                        &group,
+                        count,
+                        selected,
+                        group != "default",
+                        &self.menu_icon,
+                    );
                     ui.add_space(6.0);
-                    if response.clicked() {
+                    if response.delete_requested {
+                        self.request_delete_group(group);
+                    } else if response.row.clicked() {
                         if let Some(vault) = &mut self.vault {
                             match vault.switch_group(&group) {
                                 Ok(()) => {
                                     self.selected_key = None;
+                                    self.edit_key.clear();
                                     self.edit_value.clear();
+                                    self.delete_group_password.clear();
+                                    self.delete_group_error.clear();
                                     self.message = format!("Active group: {group}");
                                 }
                                 Err(err) => self.message = err.to_string(),
@@ -424,36 +522,9 @@ impl KeyStoreApp {
         if submit_group {
             self.create_group();
         }
-
-        if active != "default" {
-            ui.add_space(8.0);
-            if ui
-                .add_sized(
-                    [ui.available_width(), 34.0],
-                    danger_button("Delete Active Group"),
-                )
-                .clicked()
-            {
-                if let Some(vault) = &mut self.vault {
-                    match vault.delete_group(&active) {
-                        Ok(()) => {
-                            self.message = format!("Deleted group '{active}'");
-                            self.selected_key = None;
-                            self.edit_value.clear();
-                        }
-                        Err(err) => self.message = err.to_string(),
-                    }
-                }
-            }
-        }
     }
 
     fn keys_panel(&mut self, ui: &mut egui::Ui) {
-        let active = self
-            .vault
-            .as_ref()
-            .map(|vault| vault.active_group().to_string())
-            .unwrap_or_default();
         let secrets = self
             .vault
             .as_ref()
@@ -471,17 +542,36 @@ impl KeyStoreApp {
                 );
             });
         });
-        ui.label(egui::RichText::new(active).color(MUTED).size(13.0));
-        ui.add_space(12.0);
+        ui.add_space(10.0);
+        ui.add_sized(
+            [ui.available_width(), 34.0],
+            padded_singleline(&mut self.secret_search, "Search secrets"),
+        );
+        ui.add_space(10.0);
+
+        let search = self.secret_search.trim().to_lowercase();
+        let visible_secrets = if search.is_empty() {
+            secrets
+        } else {
+            secrets
+                .into_iter()
+                .filter(|key| key.to_lowercase().contains(&search))
+                .collect::<Vec<_>>()
+        };
 
         egui::ScrollArea::vertical()
             .id_salt("secrets_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if secrets.is_empty() {
-                    empty_state(ui, "No secrets in this group");
+                if visible_secrets.is_empty() {
+                    let message = if search.is_empty() {
+                        "No secrets in this group"
+                    } else {
+                        "No matching secrets"
+                    };
+                    empty_state(ui, message);
                 }
-                for key in secrets {
+                for key in visible_secrets {
                     let selected = self.selected_key.as_ref() == Some(&key);
                     let response = secret_row(ui, &key, selected);
                     ui.add_space(8.0);
@@ -502,13 +592,9 @@ impl KeyStoreApp {
             };
 
             ui.label(egui::RichText::new("Key").color(MUTED).size(12.0));
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(&key)
-                    .size(19.0)
-                    .monospace()
-                    .strong()
-                    .color(TEXT),
+            let key_response = ui.add_sized(
+                [ui.available_width(), 36.0],
+                padded_singleline(&mut self.edit_key, "Key").font(egui::TextStyle::Monospace),
             );
             ui.add_space(18.0);
             ui.label(egui::RichText::new("Value").color(MUTED).size(12.0));
@@ -516,32 +602,24 @@ impl KeyStoreApp {
                 [ui.available_width(), 150.0],
                 egui::TextEdit::multiline(&mut self.edit_value)
                     .desired_rows(7)
+                    .margin(field_margin())
                     .hint_text("Value"),
             );
             ui.add_space(14.0);
 
             ui.horizontal(|ui| {
-                if ui
-                    .add_sized([120.0, 36.0], primary_button("Update"))
-                    .clicked()
-                {
+                let submit_update = text_submitted(ui, &key_response)
+                    || ui
+                        .add_sized([120.0, 36.0], primary_button("Update"))
+                        .clicked();
+                if submit_update {
                     self.update_secret(&key);
                 }
                 if ui
                     .add_sized([100.0, 36.0], danger_button("Delete"))
                     .clicked()
                 {
-                    if let Some(vault) = &mut self.vault {
-                        match vault.delete(&key) {
-                            Ok(true) => {
-                                self.message = format!("Deleted '{key}'");
-                                self.selected_key = None;
-                                self.edit_value.clear();
-                            }
-                            Ok(false) => self.message = format!("'{key}' was already missing"),
-                            Err(err) => self.message = err.to_string(),
-                        }
-                    }
+                    self.request_delete_secret(key.clone());
                 }
             });
         });
@@ -570,6 +648,99 @@ impl KeyStoreApp {
                 self.save_secret();
             }
         });
+    }
+
+    fn confirmation_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(group) = self.pending_delete_group.clone() {
+            let mut open = true;
+            egui::Window::new("Delete group")
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_width(320.0);
+                    ui.label(egui::RichText::new(format!("Delete group \"{group}\"?")).color(TEXT));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Enter your vault password to delete this group and its secrets.",
+                        )
+                        .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    let password_response = ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        padded_singleline(&mut self.delete_group_password, "Password")
+                            .password(true),
+                    );
+                    if !self.delete_group_error.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&self.delete_group_error).color(DANGER_TEXT));
+                    }
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let confirm = text_submitted(ui, &password_response)
+                            || ui
+                                .add_sized([92.0, 34.0], danger_button("Delete"))
+                                .clicked();
+                        if confirm {
+                            self.confirm_delete_group();
+                        }
+                        if ui
+                            .add_sized([86.0, 34.0], secondary_button("Cancel"))
+                            .clicked()
+                        {
+                            self.pending_delete_group = None;
+                            self.delete_group_password.clear();
+                            self.delete_group_error.clear();
+                        }
+                    });
+                });
+            if !open {
+                self.pending_delete_group = None;
+                self.delete_group_password.clear();
+                self.delete_group_error.clear();
+            }
+        }
+
+        if let Some(key) = self.pending_delete_secret.clone() {
+            let mut open = true;
+            egui::Window::new("Delete secret")
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_width(320.0);
+                    ui.label(egui::RichText::new(format!("Delete \"{key}\"?")).color(TEXT));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("This will remove the secret from the active group.")
+                            .color(MUTED),
+                    );
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_sized([92.0, 34.0], danger_button("Delete"))
+                            .clicked()
+                        {
+                            self.confirm_delete_secret();
+                        }
+                        if ui
+                            .add_sized([86.0, 34.0], secondary_button("Cancel"))
+                            .clicked()
+                        {
+                            self.pending_delete_secret = None;
+                        }
+                    });
+                });
+            if !open {
+                self.pending_delete_secret = None;
+            }
+        }
     }
 }
 
@@ -640,17 +811,25 @@ fn apply_fonts(ctx: &egui::Context) {
 }
 
 fn load_logo_texture(ctx: &egui::Context) -> Result<egui::TextureHandle> {
-    let image = image::load_from_memory_with_format(
-        include_bytes!("../assets/logo.png"),
-        image::ImageFormat::Png,
-    )?
-    .to_rgba8();
+    load_texture(ctx, "ks_logo", include_bytes!("../assets/logo.png"))
+}
+
+fn load_menu_texture(ctx: &egui::Context) -> Result<egui::TextureHandle> {
+    load_texture(ctx, "ks_menu", include_bytes!("../assets/menu.png"))
+}
+
+fn load_texture(
+    ctx: &egui::Context,
+    name: &'static str,
+    bytes: &'static [u8],
+) -> Result<egui::TextureHandle> {
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?.to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     let pixels = image.into_raw();
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
 
     Ok(ctx.load_texture(
-        "ks_logo",
+        name,
         color_image,
         egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
     ))
@@ -734,7 +913,19 @@ fn logo_mark(ui: &mut egui::Ui, logo: &egui::TextureHandle, height: f32) -> egui
     ui.add(egui::Image::from_texture(logo).fit_to_exact_size(size))
 }
 
-fn group_row(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> egui::Response {
+struct GroupRowResponse {
+    row: egui::Response,
+    delete_requested: bool,
+}
+
+fn group_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    count: usize,
+    selected: bool,
+    can_delete: bool,
+    menu_icon: &egui::TextureHandle,
+) -> GroupRowResponse {
     let fill = if selected { SELECTED_BG } else { PANEL_ALT };
     let stroke = if selected {
         egui::Stroke::new(1.0, egui::Color32::from_gray(88))
@@ -742,6 +933,8 @@ fn group_row(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> egu
         egui::Stroke::new(1.0, egui::Color32::TRANSPARENT)
     };
 
+    let mut delete_requested = false;
+    let mut row = None;
     egui::Frame::none()
         .fill(fill)
         .stroke(stroke)
@@ -750,22 +943,37 @@ fn group_row(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> egu
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(name).size(14.0).color(if selected {
-                    SELECTED
-                } else {
-                    TEXT
-                }));
+                let menu_width = if can_delete { 28.0 } else { 0.0 };
+                let label_width = (ui.available_width() - 34.0 - menu_width).max(32.0);
+                row = Some(clickable_row_text(
+                    ui,
+                    name,
+                    egui::vec2(label_width, 24.0),
+                    14.0,
+                    egui::FontFamily::Proportional,
+                    if selected { SELECTED } else { TEXT },
+                ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(count.to_string())
-                            .size(12.0)
-                            .color(MUTED),
+                    if can_delete {
+                        delete_requested = group_delete_menu(ui, menu_icon);
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(count.to_string())
+                                .size(12.0)
+                                .color(MUTED),
+                        )
+                        .selectable(false),
                     );
                 });
             });
         })
-        .response
-        .interact(egui::Sense::click())
+        .response;
+
+    GroupRowResponse {
+        row: row.expect("group row text button should be present"),
+        delete_requested,
+    }
 }
 
 fn secret_row(ui: &mut egui::Ui, key: &str, selected: bool) -> egui::Response {
@@ -776,6 +984,7 @@ fn secret_row(ui: &mut egui::Ui, key: &str, selected: bool) -> egui::Response {
         egui::Stroke::new(1.0, BORDER)
     };
 
+    let mut row = None;
     egui::Frame::none()
         .fill(fill)
         .stroke(stroke)
@@ -792,33 +1001,82 @@ fn secret_row(ui: &mut egui::Ui, key: &str, selected: bool) -> egui::Response {
                 egui::vec2(ui.available_width(), 28.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(key)
-                                .size(13.0)
-                                .monospace()
-                                .color(if selected { SELECTED } else { TEXT }),
-                        )
-                        .selectable(false),
-                    );
+                    row = Some(clickable_row_text(
+                        ui,
+                        key,
+                        egui::vec2(ui.available_width(), 28.0),
+                        13.0,
+                        egui::FontFamily::Monospace,
+                        if selected { SELECTED } else { TEXT },
+                    ));
                 },
             );
         })
-        .response
-        .interact(egui::Sense::click())
+        .response;
+
+    row.expect("secret row text button should be present")
+}
+
+fn clickable_row_text(
+    ui: &mut egui::Ui,
+    text: &str,
+    size: egui::Vec2,
+    font_size: f32,
+    family: egui::FontFamily,
+    color: egui::Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        ui.painter().with_clip_rect(rect).text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::new(font_size, family),
+            color,
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn group_delete_menu(ui: &mut egui::Ui, menu_icon: &egui::TextureHandle) -> bool {
+    let image = egui::Image::from_texture(menu_icon).fit_to_exact_size(egui::vec2(18.0, 18.0));
+    let menu = egui::menu::menu_custom_button(
+        ui,
+        egui::Button::image(image)
+            .frame(false)
+            .min_size(egui::vec2(24.0, 24.0)),
+        |ui| {
+            ui.set_min_width(110.0);
+            let delete_clicked = ui
+                .button(egui::RichText::new("Delete").color(DANGER_TEXT))
+                .clicked();
+            if delete_clicked {
+                ui.close_menu();
+            }
+            delete_clicked
+        },
+    );
+
+    menu.response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Group actions");
+    menu.inner.unwrap_or(false)
 }
 
 fn padded_singleline<'a>(value: &'a mut String, hint: &'static str) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(value)
         .hint_text(hint)
         .vertical_align(egui::Align::Center)
-        .margin(egui::Margin {
-            left: 10.0,
-            right: 6.0,
-            top: 7.0,
-            bottom: 7.0,
-        })
+        .margin(field_margin())
+}
+
+fn field_margin() -> egui::Margin {
+    egui::Margin {
+        left: 10.0,
+        right: 6.0,
+        top: 7.0,
+        bottom: 7.0,
+    }
 }
 
 fn text_submitted(ui: &egui::Ui, response: &egui::Response) -> bool {
