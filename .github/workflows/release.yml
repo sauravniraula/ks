@@ -67,6 +67,7 @@ jobs:
           mkdir -p dist/package
           cp "target/release/${{ matrix.binary }}" "dist/package/${{ matrix.binary }}"
           cp README.md LICENSE dist/package/
+          cp assets/icon.png dist/package/
 
           cd dist/package
           if [[ "${{ runner.os }}" == "Windows" ]]; then

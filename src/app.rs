@@ -8,6 +8,8 @@ const APP_DIR: &str = "rust_keystore";
 const WINDOW_SETTINGS_FILE: &str = "window.json";
 const DEFAULT_WINDOW_SIZE: [f32; 2] = [1040.0, 680.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [820.0, 560.0];
+const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
+const DESKTOP_ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 const BG: egui::Color32 = egui::Color32::from_gray(14);
 const PANEL: egui::Color32 = egui::Color32::from_gray(24);
 const PANEL_ALT: egui::Color32 = egui::Color32::from_gray(19);
@@ -26,7 +28,8 @@ pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(initial_window_size)
-            .with_min_inner_size(MIN_WINDOW_SIZE),
+            .with_min_inner_size(MIN_WINDOW_SIZE)
+            .with_icon(load_app_icon()?),
         ..Default::default()
     };
 
@@ -811,11 +814,16 @@ fn apply_fonts(ctx: &egui::Context) {
 }
 
 fn load_logo_texture(ctx: &egui::Context) -> Result<egui::TextureHandle> {
-    load_texture(ctx, "ks_logo", include_bytes!("../assets/logo.png"))
+    load_texture(ctx, "ks_logo", LOGO_BYTES)
 }
 
 fn load_menu_texture(ctx: &egui::Context) -> Result<egui::TextureHandle> {
     load_texture(ctx, "ks_menu", include_bytes!("../assets/menu.png"))
+}
+
+fn load_app_icon() -> Result<egui::IconData> {
+    eframe::icon_data::from_png_bytes(DESKTOP_ICON_BYTES)
+        .context("failed to load desktop app icon from assets/icon.png")
 }
 
 fn load_texture(
