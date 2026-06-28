@@ -79,6 +79,14 @@ struct KeyStoreApp {
     change_password_error: String,
     show_change_password: bool,
     change_password_needs_focus: bool,
+    export_path: Option<PathBuf>,
+    export_password: String,
+    export_error: String,
+    export_password_needs_focus: bool,
+    import_path: Option<PathBuf>,
+    import_password: String,
+    import_error: String,
+    import_password_needs_focus: bool,
     pending_rename_group: Option<String>,
     pending_delete_group: Option<String>,
     pending_delete_secret: Option<String>,
@@ -119,6 +127,14 @@ impl KeyStoreApp {
             change_password_error: String::new(),
             show_change_password: false,
             change_password_needs_focus: false,
+            export_path: None,
+            export_password: String::new(),
+            export_error: String::new(),
+            export_password_needs_focus: false,
+            import_path: None,
+            import_password: String::new(),
+            import_error: String::new(),
+            import_password_needs_focus: false,
             pending_rename_group: None,
             pending_delete_group: None,
             pending_delete_secret: None,
@@ -378,6 +394,104 @@ impl KeyStoreApp {
         }
     }
 
+    fn request_export(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export encrypted vault")
+            .add_filter("KS vault export", &["json"])
+            .set_file_name("ks-export.json")
+            .save_file()
+        else {
+            return;
+        };
+
+        self.export_path = Some(path);
+        self.export_password.clear();
+        self.export_error.clear();
+        self.export_password_needs_focus = true;
+    }
+
+    fn cancel_export(&mut self) {
+        self.export_path = None;
+        self.export_password.clear();
+        self.export_error.clear();
+        self.export_password_needs_focus = false;
+    }
+
+    fn confirm_export(&mut self) {
+        self.export_error.clear();
+        let Some(path) = self.export_path.clone() else {
+            return;
+        };
+
+        let result = (|| -> Result<()> {
+            let vault = self
+                .vault
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("vault is locked"))?;
+            vault.export_to_path(&path, &self.export_password)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.cancel_export();
+                self.message = format!("Exported vault to {}", path.display());
+            }
+            Err(err) => self.export_error = err.to_string(),
+        }
+    }
+
+    fn request_import(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import encrypted vault")
+            .add_filter("KS vault export", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        self.import_path = Some(path);
+        self.import_password.clear();
+        self.import_error.clear();
+        self.import_password_needs_focus = true;
+    }
+
+    fn cancel_import(&mut self) {
+        self.import_path = None;
+        self.import_password.clear();
+        self.import_error.clear();
+        self.import_password_needs_focus = false;
+    }
+
+    fn confirm_import(&mut self) {
+        self.import_error.clear();
+        let Some(path) = self.import_path.clone() else {
+            return;
+        };
+
+        let result = (|| -> Result<()> {
+            let vault = self
+                .vault
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("vault is locked"))?;
+            vault.import_from_path(&path, &self.import_password)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.selected_key = None;
+                self.edit_key.clear();
+                self.edit_value.clear();
+                self.secret_search.clear();
+                self.copied_at = None;
+                self.cancel_import();
+                self.message = format!("Imported vault from {}", path.display());
+            }
+            Err(err) => self.import_error = err.to_string(),
+        }
+    }
+
     fn logout_vault(&mut self) {
         self.vault = None;
         self.selected_key = None;
@@ -389,6 +503,8 @@ impl KeyStoreApp {
         self.pending_delete_group = None;
         self.pending_delete_secret = None;
         self.cancel_change_password();
+        self.cancel_export();
+        self.cancel_import();
         self.login_password_needs_focus = true;
         self.copied_at = None;
         self.message = "Logged out".to_string();
@@ -551,6 +667,8 @@ impl KeyStoreApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(action) = settings_menu(ui) {
                             match action {
+                                SettingsAction::Import => self.request_import(),
+                                SettingsAction::Export => self.request_export(),
                                 SettingsAction::ChangePassword => self.request_change_password(),
                                 SettingsAction::Logout => self.logout_vault(),
                             }
@@ -937,6 +1055,127 @@ impl KeyStoreApp {
                 });
             if !open {
                 self.pending_delete_secret = None;
+            }
+        }
+
+        if let Some(path) = self.export_path.clone() {
+            let mut open = true;
+            egui::Window::new("Export vault")
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.label(
+                        egui::RichText::new("Encrypt this export with a password.").color(TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(path.display().to_string())
+                                .size(12.0)
+                                .color(MUTED),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(10.0);
+                    let password_response = ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        padded_singleline(&mut self.export_password, "Export password")
+                            .password(true),
+                    );
+                    if self.export_password_needs_focus {
+                        password_response.request_focus();
+                        self.export_password_needs_focus = false;
+                    }
+                    if !self.export_error.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&self.export_error).color(DANGER_TEXT));
+                    }
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let confirm = text_submitted(ui, &password_response)
+                            || ui
+                                .add_sized([92.0, 34.0], primary_button("Export"))
+                                .clicked();
+                        if confirm {
+                            self.confirm_export();
+                        }
+                        if ui
+                            .add_sized([86.0, 34.0], secondary_button("Cancel"))
+                            .clicked()
+                        {
+                            self.cancel_export();
+                        }
+                    });
+                });
+            if !open {
+                self.cancel_export();
+            }
+        }
+
+        if let Some(path) = self.import_path.clone() {
+            let mut open = true;
+            egui::Window::new("Import vault")
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.label(
+                        egui::RichText::new("Enter the password for this export.").color(TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Importing replaces the current vault contents.")
+                            .color(MUTED),
+                    );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(path.display().to_string())
+                                .size(12.0)
+                                .color(MUTED),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(10.0);
+                    let password_response = ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        padded_singleline(&mut self.import_password, "Export password")
+                            .password(true),
+                    );
+                    if self.import_password_needs_focus {
+                        password_response.request_focus();
+                        self.import_password_needs_focus = false;
+                    }
+                    if !self.import_error.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&self.import_error).color(DANGER_TEXT));
+                    }
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let confirm = text_submitted(ui, &password_response)
+                            || ui
+                                .add_sized([92.0, 34.0], primary_button("Import"))
+                                .clicked();
+                        if confirm {
+                            self.confirm_import();
+                        }
+                        if ui
+                            .add_sized([86.0, 34.0], secondary_button("Cancel"))
+                            .clicked()
+                        {
+                            self.cancel_import();
+                        }
+                    });
+                });
+            if !open {
+                self.cancel_import();
             }
         }
 
@@ -1358,6 +1597,8 @@ fn group_actions_menu(ui: &mut egui::Ui, menu_icon: &egui::TextureHandle) -> Opt
 }
 
 enum SettingsAction {
+    Import,
+    Export,
     ChangePassword,
     Logout,
 }
@@ -1369,6 +1610,15 @@ fn settings_menu(ui: &mut egui::Ui) -> Option<SettingsAction> {
     let menu = egui::menu::menu_custom_button(ui, button, |ui| {
         ui.set_min_width(150.0);
         let mut action = None;
+        if ui.button("Import").clicked() {
+            action = Some(SettingsAction::Import);
+            ui.close_menu();
+        }
+        if ui.button("Export").clicked() {
+            action = Some(SettingsAction::Export);
+            ui.close_menu();
+        }
+        ui.separator();
         if ui.button("Change Password").clicked() {
             action = Some(SettingsAction::ChangePassword);
             ui.close_menu();

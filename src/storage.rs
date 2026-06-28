@@ -5,12 +5,15 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const APP_DIR: &str = "rust_keystore";
 const VAULT_FILE: &str = "vault.json";
 const LEGACY_FILE: &str = "keyvalues";
 const DEFAULT_GROUP: &str = "default";
+const ENVELOPE_VERSION: u8 = 1;
+const KDF_NAME: &str = "argon2id";
+const CIPHER_NAME: &str = "xchacha20poly1305";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultData {
@@ -134,21 +137,7 @@ impl VaultStore {
     }
 
     fn read_envelope(&self) -> Result<VaultEnvelope> {
-        let content = fs::read_to_string(&self.path).context("failed to read encrypted vault")?;
-        let envelope: VaultEnvelope =
-            serde_json::from_str(&content).context("failed to parse encrypted vault envelope")?;
-
-        if envelope.version != 1 {
-            return Err(anyhow!("unsupported vault version {}", envelope.version));
-        }
-        if envelope.kdf != "argon2id" {
-            return Err(anyhow!("unsupported vault KDF {}", envelope.kdf));
-        }
-        if envelope.cipher != "xchacha20poly1305" {
-            return Err(anyhow!("unsupported vault cipher {}", envelope.cipher));
-        }
-
-        Ok(envelope)
+        read_envelope_from_path(&self.path)
     }
 
     fn open_with_key_material(
@@ -192,24 +181,46 @@ impl UnlockedVault {
     }
 
     pub fn save(&self) -> Result<()> {
-        if let Some(parent) = self.store.path.parent() {
-            fs::create_dir_all(parent).context("failed to create config directory")?;
-        }
+        ensure_parent_dir(&self.store.path, "failed to create config directory")?;
 
-        let plaintext = serde_json::to_vec_pretty(&self.data).context("failed to encode vault")?;
-        let (nonce, ciphertext) = encrypt_json(&self.key, &plaintext)?;
-        let envelope = VaultEnvelope {
-            version: 1,
-            kdf: "argon2id".to_string(),
-            cipher: "xchacha20poly1305".to_string(),
-            salt: encode(&self.salt),
-            nonce: encode(&nonce),
-            ciphertext: encode(&ciphertext),
-        };
+        let envelope = encrypted_envelope(&self.data, &self.key, &self.salt)?;
         let content =
             serde_json::to_string_pretty(&envelope).context("failed to encode vault envelope")?;
         fs::write(&self.store.path, content).context("failed to write encrypted vault")?;
         set_private_file_permissions(&self.store.path)?;
+        Ok(())
+    }
+
+    pub fn export_to_path(&self, path: &Path, password: &str) -> Result<()> {
+        if password.is_empty() {
+            return Err(anyhow!("password cannot be empty"));
+        }
+
+        ensure_parent_dir(path, "failed to create export directory")?;
+        let salt = random_salt();
+        let key = derive_key(password, &salt)?;
+        let envelope = encrypted_envelope(&self.data, &key, &salt)?;
+        let content = serde_json::to_string_pretty(&envelope).context("failed to encode export")?;
+        fs::write(path, content)
+            .with_context(|| format!("failed to write export {}", path.display()))?;
+        set_private_file_permissions(path)?;
+        Ok(())
+    }
+
+    pub fn import_from_path(&mut self, path: &Path, password: &str) -> Result<()> {
+        if password.is_empty() {
+            return Err(anyhow!("password cannot be empty"));
+        }
+
+        let data = read_vault_data_from_path(path, password)?;
+        validate_imported_data(&data)?;
+        let previous_data = self.data.clone();
+
+        self.data = data;
+        if let Err(err) = self.save() {
+            self.data = previous_data;
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -342,6 +353,80 @@ impl UnlockedVault {
     }
 }
 
+fn encrypted_envelope(data: &VaultData, key: &VaultKey, salt: &[u8]) -> Result<VaultEnvelope> {
+    let plaintext = serde_json::to_vec_pretty(data).context("failed to encode vault")?;
+    let (nonce, ciphertext) = encrypt_json(key, &plaintext)?;
+    Ok(VaultEnvelope {
+        version: ENVELOPE_VERSION,
+        kdf: KDF_NAME.to_string(),
+        cipher: CIPHER_NAME.to_string(),
+        salt: encode(salt),
+        nonce: encode(&nonce),
+        ciphertext: encode(&ciphertext),
+    })
+}
+
+fn read_vault_data_from_path(path: &Path, password: &str) -> Result<VaultData> {
+    let envelope = read_envelope_from_path(path)?;
+    let salt = decode(&envelope.salt, "salt")?;
+    let nonce = decode(&envelope.nonce, "nonce")?;
+    let ciphertext = decode(&envelope.ciphertext, "ciphertext")?;
+    let key = derive_key(password, &salt)?;
+    let plaintext = decrypt_json(&key, &nonce, &ciphertext)?;
+    serde_json::from_slice(&plaintext).context("failed to parse decrypted vault")
+}
+
+fn read_envelope_from_path(path: &Path) -> Result<VaultEnvelope> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read encrypted vault {}", path.display()))?;
+    let envelope: VaultEnvelope =
+        serde_json::from_str(&content).context("failed to parse encrypted vault envelope")?;
+
+    if envelope.version != ENVELOPE_VERSION {
+        return Err(anyhow!("unsupported vault version {}", envelope.version));
+    }
+    if envelope.kdf != KDF_NAME {
+        return Err(anyhow!("unsupported vault KDF {}", envelope.kdf));
+    }
+    if envelope.cipher != CIPHER_NAME {
+        return Err(anyhow!("unsupported vault cipher {}", envelope.cipher));
+    }
+
+    Ok(envelope)
+}
+
+fn validate_imported_data(data: &VaultData) -> Result<()> {
+    if data.groups.is_empty() {
+        return Err(anyhow!("imported vault contains no groups"));
+    }
+    if !data.groups.contains_key(&data.active_group) {
+        return Err(anyhow!(
+            "imported vault active group '{}' is missing",
+            data.active_group
+        ));
+    }
+
+    for (group_name, group) in &data.groups {
+        validate_name(group_name)
+            .with_context(|| format!("invalid imported group name '{group_name}'"))?;
+        for key in group.secrets.keys() {
+            validate_name(key).with_context(|| format!("invalid imported secret name '{key}'"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_parent_dir(path: &Path, context: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).context(context.to_string())?;
+    }
+    Ok(())
+}
+
 fn validate_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         return Err(anyhow!("name cannot be empty"));
@@ -353,7 +438,7 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub fn set_private_file_permissions(path: &PathBuf) -> Result<()> {
+pub fn set_private_file_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut permissions = fs::metadata(path)
@@ -366,6 +451,6 @@ pub fn set_private_file_permissions(path: &PathBuf) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub fn set_private_file_permissions(_path: &PathBuf) -> Result<()> {
+pub fn set_private_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
