@@ -73,6 +73,11 @@ create_macos_icon() {
     local temp_dir iconset
 
     cp "$ICON_PNG" "$resources_dir/icon.png"
+    if command -v sips >/dev/null 2>&1 && \
+        sips -s format icns "$ICON_PNG" --out "$resources_dir/icon.icns" >/dev/null 2>&1; then
+        return
+    fi
+
     if ! command -v sips >/dev/null 2>&1 || ! command -v iconutil >/dev/null 2>&1; then
         return
     fi
@@ -124,7 +129,7 @@ install_macos() {
     <key>CFBundleExecutable</key>
     <string>$BIN_NAME</string>
     <key>CFBundleIconFile</key>
-    <string>icon.icns</string>
+    <string>icon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleSignature</key>

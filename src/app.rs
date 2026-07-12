@@ -64,6 +64,7 @@ struct KeyStoreApp {
     selected_key: Option<String>,
     edit_key: String,
     edit_value: String,
+    show_secret_value: bool,
     secret_search: String,
     new_key: String,
     new_value: String,
@@ -112,6 +113,7 @@ impl KeyStoreApp {
             selected_key: None,
             edit_key: String::new(),
             edit_value: String::new(),
+            show_secret_value: false,
             secret_search: String::new(),
             new_key: String::new(),
             new_value: String::new(),
@@ -186,11 +188,13 @@ impl KeyStoreApp {
             Ok(Some(value)) => {
                 self.edit_key = key.clone();
                 self.edit_value = value.clone();
+                self.show_secret_value = false;
             }
             _ => {
                 self.selected_key = None;
                 self.edit_key.clear();
                 self.edit_value.clear();
+                self.show_secret_value = false;
                 self.copied_at = None;
             }
         }
@@ -205,6 +209,7 @@ impl KeyStoreApp {
                     self.selected_key = None;
                     self.edit_key.clear();
                     self.edit_value.clear();
+                    self.show_secret_value = false;
                     self.copied_at = None;
                 }
                 Err(err) => self.message = err.to_string(),
@@ -219,6 +224,7 @@ impl KeyStoreApp {
                     self.selected_key = Some(self.new_key.clone());
                     self.edit_key = self.new_key.clone();
                     self.edit_value = self.new_value.clone();
+                    self.show_secret_value = false;
                     self.copied_at = None;
                     self.message = format!("Saved '{}'", self.new_key);
                     self.new_key.clear();
@@ -239,6 +245,7 @@ impl KeyStoreApp {
                         self.message = format!("Renamed '{key}' to '{}'", self.edit_key);
                     }
                     self.selected_key = Some(self.edit_key.clone());
+                    self.show_secret_value = false;
                     self.copied_at = None;
                 }
                 Err(err) => self.message = err.to_string(),
@@ -312,6 +319,7 @@ impl KeyStoreApp {
                         self.selected_key = None;
                         self.edit_key.clear();
                         self.edit_value.clear();
+                        self.show_secret_value = false;
                         self.copied_at = None;
                     }
                 }
@@ -337,6 +345,7 @@ impl KeyStoreApp {
                         self.selected_key = None;
                         self.edit_key.clear();
                         self.edit_value.clear();
+                        self.show_secret_value = false;
                         self.copied_at = None;
                     }
                 }
@@ -484,6 +493,7 @@ impl KeyStoreApp {
                 self.edit_key.clear();
                 self.edit_value.clear();
                 self.secret_search.clear();
+                self.show_secret_value = false;
                 self.copied_at = None;
                 self.cancel_import();
                 self.message = format!("Imported vault from {}", path.display());
@@ -497,6 +507,7 @@ impl KeyStoreApp {
         self.selected_key = None;
         self.edit_key.clear();
         self.edit_value.clear();
+        self.show_secret_value = false;
         self.cancel_rename_group();
         self.delete_group_password.clear();
         self.delete_group_error.clear();
@@ -744,6 +755,7 @@ impl KeyStoreApp {
                                     self.selected_key = None;
                                     self.edit_key.clear();
                                     self.edit_value.clear();
+                                    self.show_secret_value = false;
                                     self.copied_at = None;
                                     self.delete_group_password.clear();
                                     self.delete_group_error.clear();
@@ -856,6 +868,9 @@ impl KeyStoreApp {
                         self.copied_at = Some(now);
                         ui.ctx().request_repaint_after(Duration::from_secs(1));
                     }
+                    if secret_visibility_icon_button(ui, self.show_secret_value).clicked() {
+                        self.show_secret_value = !self.show_secret_value;
+                    }
                     if let Some(copied_at) = self.copied_at {
                         let remaining = 1.0 - (now - copied_at);
                         if remaining > 0.0 {
@@ -873,7 +888,8 @@ impl KeyStoreApp {
                 egui::TextEdit::multiline(&mut self.edit_value)
                     .desired_rows(7)
                     .margin(field_margin())
-                    .hint_text("Value"),
+                    .hint_text("Value")
+                    .password(!self.show_secret_value),
             );
             ui.add_space(14.0);
 
@@ -1634,6 +1650,57 @@ fn settings_menu(ui: &mut egui::Ui) -> Option<SettingsAction> {
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text("Settings");
     menu.inner.flatten()
+}
+
+fn secret_visibility_icon_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
+    let size = egui::vec2(20.0, 20.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let fill = if response.is_pointer_button_down_on() {
+            SELECTED_BG
+        } else if response.hovered() {
+            HOVER_BG
+        } else {
+            FIELD_BG
+        };
+        let stroke = egui::Stroke::new(1.0_f32, if response.hovered() { MUTED } else { BORDER });
+        let painter = ui.painter();
+        painter.rect(rect, egui::Rounding::same(4.0), fill, stroke);
+
+        let center = rect.center();
+        let icon_stroke = egui::Stroke::new(1.25_f32, TEXT);
+        let mut top = Vec::with_capacity(9);
+        let mut bottom = Vec::with_capacity(9);
+        for i in 0..=8 {
+            let t = i as f32 / 8.0;
+            let x = center.x - 5.5 + 11.0 * t;
+            let arc = (std::f32::consts::PI * t).sin() * 3.5;
+            top.push(egui::pos2(x, center.y - arc));
+            bottom.push(egui::pos2(x, center.y + arc));
+        }
+        painter.add(egui::Shape::line(top, icon_stroke));
+        painter.add(egui::Shape::line(bottom, icon_stroke));
+        painter.circle_filled(center, 1.6, TEXT);
+
+        if visible {
+            painter.line_segment(
+                [
+                    center + egui::vec2(-5.0, 5.0),
+                    center + egui::vec2(5.0, -5.0),
+                ],
+                icon_stroke,
+            );
+        }
+    }
+
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(if visible {
+            "Hide secret value"
+        } else {
+            "Reveal secret value"
+        })
 }
 
 fn copy_icon_button(ui: &mut egui::Ui) -> egui::Response {
