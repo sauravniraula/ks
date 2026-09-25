@@ -140,6 +140,11 @@ install_macos() {
 </plist>
 EOF_PLIST
 
+    touch "$app_dir"
+    if command -v codesign >/dev/null 2>&1; then
+        codesign --force --deep --sign - "$app_dir" >/dev/null 2>&1 || true
+    fi
+
     printf '%s installed.\n' "$APP_NAME"
     printf 'Application bundle: %s\n' "$app_dir"
     printf 'Binary: %s\n' "$macos_dir/$BIN_NAME"
