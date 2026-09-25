@@ -1,8 +1,9 @@
+use crate::api_keys::Access;
 use crate::storage::{UnlockedVault, VaultStore};
 use anyhow::{Context as AnyhowContext, Result};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
 
 const APP_DIR: &str = "rust_keystore";
 const WINDOW_SETTINGS_FILE: &str = "window.json";
@@ -53,6 +54,12 @@ pub fn run() -> Result<()> {
     .map_err(|err| anyhow::anyhow!("failed to launch desktop app: {err}"))
 }
 
+#[derive(Clone)]
+enum ApiKeyForm {
+    Create,
+    Edit(String),
+}
+
 struct KeyStoreApp {
     logo: egui::TextureHandle,
     menu_icon: egui::TextureHandle,
@@ -91,6 +98,15 @@ struct KeyStoreApp {
     pending_rename_group: Option<String>,
     pending_delete_group: Option<String>,
     pending_delete_secret: Option<String>,
+    show_api_keys: bool,
+    api_key_form: Option<ApiKeyForm>,
+    api_key_name: String,
+    api_key_permissions: BTreeMap<String, Access>,
+    api_key_unlimited: bool,
+    api_key_expiry_date: String,
+    api_key_error: String,
+    api_issued_token: Option<String>,
+    pending_delete_api_key: Option<String>,
     login_password_needs_focus: bool,
     copied_at: Option<f64>,
     message: String,
@@ -140,6 +156,15 @@ impl KeyStoreApp {
             pending_rename_group: None,
             pending_delete_group: None,
             pending_delete_secret: None,
+            show_api_keys: false,
+            api_key_form: None,
+            api_key_name: String::new(),
+            api_key_permissions: BTreeMap::new(),
+            api_key_unlimited: true,
+            api_key_expiry_date: String::new(),
+            api_key_error: String::new(),
+            api_issued_token: None,
+            pending_delete_api_key: None,
             login_password_needs_focus: true,
             copied_at: None,
             message: String::new(),
@@ -489,6 +514,8 @@ impl KeyStoreApp {
 
         match result {
             Ok(()) => {
+                self.api_issued_token = None;
+                self.api_key_form = None;
                 self.selected_key = None;
                 self.edit_key.clear();
                 self.edit_value.clear();
@@ -502,8 +529,94 @@ impl KeyStoreApp {
         }
     }
 
+    fn open_api_key_form(&mut self, id: Option<String>) {
+        self.api_key_error.clear();
+        self.api_issued_token = None;
+        self.api_key_permissions.clear();
+        self.api_key_name.clear();
+        self.api_key_expiry_date.clear();
+        self.api_key_unlimited = true;
+        if let Some(id) = id {
+            if let Some(record) = self
+                .vault
+                .as_ref()
+                .and_then(|vault| vault.data().api_keys.get(&id))
+            {
+                self.api_key_name = record.name.clone();
+                self.api_key_permissions = record.permissions.clone();
+                self.api_key_unlimited = record.expires_at.is_none();
+                if let Some(expires_at) = record.expires_at {
+                    self.api_key_expiry_date = chrono::DateTime::from_timestamp(expires_at, 0)
+                        .map(|date| date.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default();
+                }
+                self.api_key_form = Some(ApiKeyForm::Edit(id));
+            }
+        } else {
+            self.api_key_form = Some(ApiKeyForm::Create);
+        }
+    }
+
+    fn save_api_key_form(&mut self) {
+        let result = (|| -> Result<String> {
+            let expires_at = parse_expiry_date(self.api_key_unlimited, &self.api_key_expiry_date)?;
+            let vault = self
+                .vault
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("vault is locked"))?;
+            let (_, token) = match self.api_key_form.as_ref() {
+                Some(ApiKeyForm::Create) => vault.create_api_key(
+                    &self.api_key_name,
+                    self.api_key_permissions.clone(),
+                    expires_at,
+                )?,
+                Some(ApiKeyForm::Edit(id)) => vault.edit_api_key(
+                    id,
+                    &self.api_key_name,
+                    self.api_key_permissions.clone(),
+                    expires_at,
+                )?,
+                None => return Err(anyhow::anyhow!("API key form is closed")),
+            };
+            Ok(token)
+        })();
+        match result {
+            Ok(token) => {
+                self.api_key_form = None;
+                self.api_key_error.clear();
+                self.api_issued_token = Some(token);
+                self.message =
+                    "API key saved. Copy the new token now; it will not be shown again.".into();
+            }
+            Err(err) => self.api_key_error = err.to_string(),
+        }
+    }
+
+    fn confirm_delete_api_key(&mut self) {
+        let Some(id) = self.pending_delete_api_key.clone() else {
+            return;
+        };
+        match self
+            .vault
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("vault is locked"))
+            .and_then(|vault| vault.delete_api_key(&id))
+        {
+            Ok(()) => {
+                self.pending_delete_api_key = None;
+                self.api_issued_token = None;
+                self.message = "API key deleted".into();
+            }
+            Err(err) => self.message = err.to_string(),
+        }
+    }
+
     fn logout_vault(&mut self) {
         self.vault = None;
+        self.show_api_keys = false;
+        self.api_key_form = None;
+        self.api_issued_token = None;
+        self.pending_delete_api_key = None;
         self.selected_key = None;
         self.edit_key.clear();
         self.edit_value.clear();
@@ -551,6 +664,18 @@ impl eframe::App for KeyStoreApp {
 
         self.top_bar(ctx);
 
+        if self.show_api_keys {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(BG)
+                        .inner_margin(egui::Margin::same(22.0)),
+                )
+                .show(ctx, |ui| self.api_keys_view(ui));
+            self.api_key_dialogs(ctx);
+            return;
+        }
+
         egui::SidePanel::left("groups_sidebar")
             .exact_width(260.0)
             .resizable(false)
@@ -586,6 +711,203 @@ impl eframe::App for KeyStoreApp {
 }
 
 impl KeyStoreApp {
+    fn api_keys_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("← Back").clicked() {
+                self.show_api_keys = false;
+            }
+            ui.add_space(12.0);
+            section_title(ui, "API Keys");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(primary_button("Create API Key")).clicked() {
+                    self.open_api_key_form(None);
+                }
+            });
+        });
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("Keys authorize the local MCP server. Tokens are only shown once.")
+                .color(MUTED),
+        );
+        if !self.message.is_empty() {
+            ui.label(egui::RichText::new(&self.message).color(MUTED));
+        }
+        let records = self
+            .vault
+            .as_ref()
+            .map(|vault| vault.data().api_keys.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if records.is_empty() {
+                empty_state(ui, "No API keys yet");
+            }
+            for record in records {
+                card_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&record.name).color(TEXT).strong());
+                        let expiry = record
+                            .expires_at
+                            .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+                            .map(|date| format!("Expires {} UTC", date.format("%Y-%m-%d")))
+                            .unwrap_or_else(|| "Unlimited".to_string());
+                        ui.label(egui::RichText::new(expiry).color(MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(danger_button("Delete")).clicked() {
+                                self.pending_delete_api_key = Some(record.id.clone());
+                            }
+                            if ui.add(secondary_button("Edit")).clicked() {
+                                self.open_api_key_form(Some(record.id.clone()));
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(format!("{} groups", record.permissions.len()))
+                            .color(MUTED),
+                    );
+                });
+                ui.add_space(8.0);
+            }
+        });
+    }
+
+    fn api_key_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(form) = self.api_key_form.clone() {
+            let mut open = true;
+            let title = match form {
+                ApiKeyForm::Create => "Create API Key",
+                ApiKeyForm::Edit(_) => "Edit API Key",
+            };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(true)
+                .order(egui::Order::Foreground)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_min_width(410.0);
+                    ui.label("Name");
+                    ui.add_sized(
+                        [ui.available_width(), 32.0],
+                        padded_singleline(&mut self.api_key_name, "Key name"),
+                    );
+                    ui.add_space(10.0);
+                    ui.label("Group access");
+                    let groups = self
+                        .vault
+                        .as_ref()
+                        .map(|vault| vault.data().groups.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    for group in groups {
+                        ui.horizontal(|ui| {
+                            let mut enabled = self.api_key_permissions.contains_key(&group);
+                            ui.checkbox(&mut enabled, &group);
+                            if enabled {
+                                let mut access = *self
+                                    .api_key_permissions
+                                    .get(&group)
+                                    .unwrap_or(&Access::ReadOnly);
+                                ui.selectable_value(&mut access, Access::ReadOnly, "Read only");
+                                ui.selectable_value(&mut access, Access::ReadWrite, "Read + write");
+                                self.api_key_permissions.insert(group.clone(), access);
+                            } else {
+                                self.api_key_permissions.remove(&group);
+                            }
+                        });
+                    }
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut self.api_key_unlimited, "Unlimited expiry");
+                    if !self.api_key_unlimited {
+                        ui.label("Expiry date (UTC, YYYY-MM-DD)");
+                        ui.add_sized(
+                            [ui.available_width(), 32.0],
+                            padded_singleline(&mut self.api_key_expiry_date, "YYYY-MM-DD"),
+                        );
+                    }
+                    if matches!(form, ApiKeyForm::Edit(_)) {
+                        ui.label(
+                            egui::RichText::new(
+                                "Saving rotates this key; the previous token stops working.",
+                            )
+                            .color(MUTED),
+                        );
+                    }
+                    if !self.api_key_error.is_empty() {
+                        ui.label(egui::RichText::new(&self.api_key_error).color(DANGER_TEXT));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.add(primary_button("Save")).clicked() {
+                            self.save_api_key_form();
+                        }
+                        if ui.add(secondary_button("Cancel")).clicked() {
+                            self.api_key_form = None;
+                        }
+                    });
+                });
+            if !open {
+                self.api_key_form = None;
+            }
+        }
+        if let Some(token) = self.api_issued_token.clone() {
+            let mut open = true;
+            egui::Window::new("Copy API Key")
+                .collapsible(false)
+                .resizable(true)
+                .order(egui::Order::Foreground)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_min_width(450.0);
+                    ui.label("Copy this token now. It cannot be viewed again.");
+                    let mut display = token.clone();
+                    ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        egui::TextEdit::singleline(&mut display)
+                            .font(egui::TextStyle::Monospace)
+                            .interactive(false),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(primary_button("Copy token")).clicked() {
+                            ui.ctx().copy_text(token.clone());
+                        }
+                        if ui.add(secondary_button("Done")).clicked() {
+                            self.api_issued_token = None;
+                        }
+                    });
+                });
+            if !open {
+                self.api_issued_token = None;
+            }
+        }
+        if let Some(id) = self.pending_delete_api_key.clone() {
+            let mut open = true;
+            egui::Window::new("Delete API Key")
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    let name = self
+                        .vault
+                        .as_ref()
+                        .and_then(|vault| vault.data().api_keys.get(&id))
+                        .map(|key| key.name.as_str())
+                        .unwrap_or("this key");
+                    ui.label(format!(
+                        "Delete {name}? This revokes its token immediately."
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.add(danger_button("Delete")).clicked() {
+                            self.confirm_delete_api_key();
+                        }
+                        if ui.add(secondary_button("Cancel")).clicked() {
+                            self.pending_delete_api_key = None;
+                        }
+                    });
+                });
+            if !open {
+                self.pending_delete_api_key = None;
+            }
+        }
+    }
+
     fn login_view(&mut self, ui: &mut egui::Ui) {
         let vault_exists = self.store().map(|store| store.exists()).unwrap_or(false);
         let title = if vault_exists {
@@ -681,6 +1003,7 @@ impl KeyStoreApp {
                                 SettingsAction::Import => self.request_import(),
                                 SettingsAction::Export => self.request_export(),
                                 SettingsAction::ChangePassword => self.request_change_password(),
+                                SettingsAction::ApiKeys => self.show_api_keys = true,
                                 SettingsAction::Logout => self.logout_vault(),
                             }
                         }
@@ -1613,6 +1936,7 @@ fn group_actions_menu(ui: &mut egui::Ui, menu_icon: &egui::TextureHandle) -> Opt
 }
 
 enum SettingsAction {
+    ApiKeys,
     Import,
     Export,
     ChangePassword,
@@ -1626,6 +1950,11 @@ fn settings_menu(ui: &mut egui::Ui) -> Option<SettingsAction> {
     let menu = egui::menu::menu_custom_button(ui, button, |ui| {
         ui.set_min_width(150.0);
         let mut action = None;
+        if ui.button("API Keys").clicked() {
+            action = Some(SettingsAction::ApiKeys);
+            ui.close_menu();
+        }
+        ui.separator();
         if ui.button("Import").clicked() {
             action = Some(SettingsAction::Import);
             ui.close_menu();
@@ -1773,6 +2102,91 @@ fn danger_button(label: &str) -> egui::Button<'_> {
         .rounding(egui::Rounding::same(6.0))
 }
 
+fn parse_expiry_date(unlimited: bool, date: &str) -> Result<Option<i64>> {
+    if unlimited {
+        return Ok(None);
+    }
+    let date = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
+        .context("enter an expiry date as YYYY-MM-DD")?;
+    let end_of_day = date
+        .and_hms_opt(23, 59, 59)
+        .ok_or_else(|| anyhow::anyhow!("invalid expiry date"))?
+        .and_utc()
+        .timestamp();
+    if end_of_day <= crate::api_keys::now()? {
+        return Err(anyhow::anyhow!("expiry must be in the future"));
+    }
+    Ok(Some(end_of_day))
+}
+
 fn message_color() -> egui::Color32 {
     MUTED
+}
+
+#[cfg(test)]
+mod api_key_tests {
+    use super::*;
+    use crate::api_keys;
+
+    #[test]
+    fn desktop_form_issues_token_and_edit_rotates_it() {
+        let path = std::env::temp_dir().join(format!("ks-ui-test-{}.json", api_keys::new_id()));
+        let store = VaultStore::for_test(path.clone());
+        let vault = store.create("test-only-password").unwrap();
+        let ctx = egui::Context::default();
+        let image = egui::ColorImage::new([1, 1], egui::Color32::WHITE);
+        let texture = ctx.load_texture("test", image, Default::default());
+        let mut app = KeyStoreApp::new(texture.clone(), texture, DEFAULT_WINDOW_SIZE);
+        app.vault = Some(vault);
+
+        app.open_api_key_form(None);
+        app.api_key_name = "my client".into();
+        app.api_key_permissions
+            .insert("default".into(), Access::ReadOnly);
+        app.save_api_key_form();
+        assert!(app.api_key_error.is_empty());
+        let old_token = app.api_issued_token.clone().unwrap();
+        let old_id = app
+            .vault
+            .as_ref()
+            .unwrap()
+            .data()
+            .api_keys
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+
+        app.open_api_key_form(Some(old_id));
+        app.api_key_permissions
+            .insert("default".into(), Access::ReadWrite);
+        app.save_api_key_form();
+        let vault = app.vault.as_ref().unwrap();
+        assert!(api_keys::authenticate(&old_token, vault).is_err());
+        assert_eq!(
+            api_keys::authenticate(app.api_issued_token.as_deref().unwrap(), vault)
+                .unwrap()
+                .permissions["default"],
+            Access::ReadWrite
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn expiry_date_is_end_of_day_utc_and_unlimited_is_optional() {
+        let date = (chrono::Utc::now() + chrono::Duration::days(10))
+            .format("%Y-%m-%d")
+            .to_string();
+        let expires = parse_expiry_date(false, &date).unwrap().unwrap();
+        assert_eq!(
+            chrono::DateTime::from_timestamp(expires, 0)
+                .unwrap()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            format!("{date} 23:59:59")
+        );
+        assert_eq!(parse_expiry_date(true, "").unwrap(), None);
+        assert!(parse_expiry_date(false, "invalid").is_err());
+        assert!(parse_expiry_date(false, "2000-01-01").is_err());
+    }
 }
